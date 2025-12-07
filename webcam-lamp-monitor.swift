@@ -19,9 +19,16 @@ let shortcutOff = "MeetingOFF"
 let shortcutSoon = "MeetingSOON"
 let checkInterval: UInt32 = 2  // seconds
 let meetingWarningMinutes = 5  // minutes before meeting to trigger warning
+let debounceCount = 2  // Require this many consistent readings before changing state
+
+// Lock file to prevent multiple instances
+let lockFilePath = "/tmp/webcam-lamp-monitor.lock"
+var lockFileDescriptor: Int32 = -1
 
 // State tracking
 var lastCameraState = false
+var pendingState: Bool? = nil  // State we're transitioning to
+var stableReadings = 0  // Count of consistent readings
 var warnedMeetingIds = Set<String>()  // Track meetings we've already warned about
 let eventStore = EKEventStore()
 var calendarAccessGranted = false
@@ -31,6 +38,42 @@ func log(_ message: String) {
     formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
     print("[\(formatter.string(from: Date()))] \(message)")
     fflush(stdout)
+}
+
+func acquireLock() -> Bool {
+    // Create or open lock file
+    lockFileDescriptor = open(lockFilePath, O_CREAT | O_RDWR, 0o644)
+    if lockFileDescriptor < 0 {
+        log("Error: Could not create lock file")
+        return false
+    }
+
+    // Try to acquire exclusive lock (non-blocking)
+    if flock(lockFileDescriptor, LOCK_EX | LOCK_NB) != 0 {
+        log("Error: Another instance is already running")
+        close(lockFileDescriptor)
+        lockFileDescriptor = -1
+        return false
+    }
+
+    // Write our PID to the lock file
+    let pid = String(getpid())
+    ftruncate(lockFileDescriptor, 0)
+    lseek(lockFileDescriptor, 0, SEEK_SET)
+    _ = pid.withCString { ptr in
+        write(lockFileDescriptor, ptr, strlen(ptr))
+    }
+
+    return true
+}
+
+func releaseLock() {
+    if lockFileDescriptor >= 0 {
+        flock(lockFileDescriptor, LOCK_UN)
+        close(lockFileDescriptor)
+        unlink(lockFilePath)
+        lockFileDescriptor = -1
+    }
 }
 
 func requestCalendarAccess() {
@@ -249,6 +292,12 @@ func main() {
     log("Webcam Lamp Monitor started")
     log("Shortcuts: ON='\(shortcutOn)', OFF='\(shortcutOff)', SOON='\(shortcutSoon)'")
     log("Check interval: \(checkInterval)s, Meeting warning: \(meetingWarningMinutes) min before")
+    log("Debounce: \(debounceCount) consistent readings required")
+
+    // Acquire lock to prevent multiple instances
+    guard acquireLock() else {
+        exit(1)
+    }
 
     // Request calendar access
     requestCalendarAccess()
@@ -256,10 +305,12 @@ func main() {
     // Handle graceful shutdown
     signal(SIGTERM) { _ in
         log("Shutting down...")
+        releaseLock()
         exit(0)
     }
     signal(SIGINT) { _ in
         log("Shutting down...")
+        releaseLock()
         exit(0)
     }
 
@@ -269,15 +320,35 @@ func main() {
         // Check camera state every loop
         let currentCameraState = isAnyCameraActive()
 
+        // Debounce: require consistent readings before changing state
         if currentCameraState != lastCameraState {
-            if currentCameraState {
-                log("Camera became ACTIVE")
-                runShortcut(shortcutOn)
+            // State might be changing
+            if pendingState == currentCameraState {
+                // Same pending state, increment counter
+                stableReadings += 1
             } else {
-                log("Camera became INACTIVE")
-                runShortcut(shortcutOff)
+                // New pending state, reset counter
+                pendingState = currentCameraState
+                stableReadings = 1
             }
-            lastCameraState = currentCameraState
+
+            // Only trigger state change after enough consistent readings
+            if stableReadings >= debounceCount {
+                if currentCameraState {
+                    log("Camera became ACTIVE (after \(stableReadings) consistent readings)")
+                    runShortcut(shortcutOn)
+                } else {
+                    log("Camera became INACTIVE (after \(stableReadings) consistent readings)")
+                    runShortcut(shortcutOff)
+                }
+                lastCameraState = currentCameraState
+                pendingState = nil
+                stableReadings = 0
+            }
+        } else {
+            // State is stable, reset pending
+            pendingState = nil
+            stableReadings = 0
         }
 
         // Check upcoming meetings every 30 seconds (15 loops at 2s interval)
