@@ -33,11 +33,43 @@ var warnedMeetingIds = Set<String>()  // Track meetings we've already warned abo
 let eventStore = EKEventStore()
 var calendarAccessGranted = false
 
+// Shortcut queue - only keeps the final desired state
+let shortcutLock = NSLock()
+var pendingShortcut: String? = nil
+var shortcutRunning = false
+let shortcutQueue = DispatchQueue(label: "com.webcamlampcontroller.shortcuts")
+
 func log(_ message: String) {
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
     print("[\(formatter.string(from: Date()))] \(message)")
     fflush(stdout)
+}
+
+func isProcessRunning(pid: pid_t) -> Bool {
+    // kill with signal 0 checks if process exists without sending a signal
+    return kill(pid, 0) == 0
+}
+
+func cleanStaleLock() -> Bool {
+    // Try to read the PID from existing lock file
+    guard let contents = try? String(contentsOfFile: lockFilePath, encoding: .utf8),
+          let pid = pid_t(contents.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        // Can't read PID, assume stale and remove
+        log("Removing unreadable lock file")
+        unlink(lockFilePath)
+        return true
+    }
+
+    // Check if the process is still running
+    if isProcessRunning(pid: pid) {
+        return false  // Process is alive, lock is valid
+    }
+
+    // Process is dead, remove stale lock
+    log("Removing stale lock file (PID \(pid) is not running)")
+    unlink(lockFilePath)
+    return true
 }
 
 func acquireLock() -> Bool {
@@ -50,10 +82,27 @@ func acquireLock() -> Bool {
 
     // Try to acquire exclusive lock (non-blocking)
     if flock(lockFileDescriptor, LOCK_EX | LOCK_NB) != 0 {
-        log("Error: Another instance is already running")
         close(lockFileDescriptor)
         lockFileDescriptor = -1
-        return false
+
+        // Check if the lock is stale
+        if cleanStaleLock() {
+            // Try again after cleaning stale lock
+            lockFileDescriptor = open(lockFilePath, O_CREAT | O_RDWR, 0o644)
+            if lockFileDescriptor < 0 {
+                log("Error: Could not create lock file after cleanup")
+                return false
+            }
+            if flock(lockFileDescriptor, LOCK_EX | LOCK_NB) != 0 {
+                log("Error: Could not acquire lock after cleanup")
+                close(lockFileDescriptor)
+                lockFileDescriptor = -1
+                return false
+            }
+        } else {
+            log("Error: Another instance is already running")
+            return false
+        }
     }
 
     // Write our PID to the lock file
@@ -267,9 +316,7 @@ func checkUpcomingMeetings() {
     ))
 }
 
-func runShortcut(_ name: String) {
-    log("Running shortcut: \(name)")
-
+func executeShortcut(_ name: String) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/shortcuts")
     process.arguments = ["run", name]
@@ -279,12 +326,66 @@ func runShortcut(_ name: String) {
         process.waitUntilExit()
 
         if process.terminationStatus == 0 {
-            log("Shortcut completed successfully")
+            log("Shortcut '\(name)' completed successfully")
         } else {
-            log("Warning: Shortcut may have failed (exit code \(process.terminationStatus))")
+            log("Warning: Shortcut '\(name)' may have failed (exit code \(process.terminationStatus))")
         }
     } catch {
-        log("Error running shortcut: \(error.localizedDescription)")
+        log("Error running shortcut '\(name)': \(error.localizedDescription)")
+    }
+}
+
+func processShortcutQueue() {
+    shortcutQueue.async {
+        while true {
+            // Get next shortcut to run (if any)
+            shortcutLock.lock()
+            let shortcutToRun = pendingShortcut
+            pendingShortcut = nil
+            if shortcutToRun != nil {
+                shortcutRunning = true
+            } else {
+                shortcutRunning = false
+            }
+            shortcutLock.unlock()
+
+            guard let name = shortcutToRun else {
+                return
+            }
+
+            log("Running shortcut: \(name)")
+            executeShortcut(name)
+        }
+    }
+}
+
+func runShortcut(_ name: String) {
+    shortcutLock.lock()
+
+    // For ON/OFF shortcuts, replace any pending shortcut (coalesce rapid changes)
+    if name == shortcutOn || name == shortcutOff {
+        if let pending = pendingShortcut, pending != name {
+            log("Replacing pending shortcut '\(pending)' with '\(name)'")
+        }
+        pendingShortcut = name
+    } else {
+        // For other shortcuts (like SOON), queue if nothing pending
+        if pendingShortcut == nil {
+            pendingShortcut = name
+        } else {
+            // SOON doesn't replace ON/OFF, just skip if something is pending
+            log("Skipping '\(name)' - another shortcut is pending")
+            shortcutLock.unlock()
+            return
+        }
+    }
+
+    let shouldStartProcessing = !shortcutRunning
+    shortcutLock.unlock()
+
+    // Start processing if not already running
+    if shouldStartProcessing {
+        processShortcutQueue()
     }
 }
 
