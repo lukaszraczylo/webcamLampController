@@ -30,6 +30,8 @@ var lastCameraState = false
 var pendingState: Bool? = nil  // State we're transitioning to
 var stableReadings = 0  // Count of consistent readings
 var warnedMeetingIds = Set<String>()  // Track meetings we've already warned about
+var meetingStartTimes = [String: Date]()  // Track start times of meetings we warned about
+var inSoonState = false  // Track if we're currently in SOON state (lamp showing warning)
 let eventStore = EKEventStore()
 var calendarAccessGranted = false
 
@@ -301,6 +303,8 @@ func checkUpcomingMeetings() {
             log("Upcoming meeting in \(minutesUntil) min: \(meeting.title ?? "Untitled")")
             runShortcut(shortcutSoon)
             warnedMeetingIds.insert(meetingId)
+            meetingStartTimes[meetingId] = meeting.startDate
+            inSoonState = true
         }
     }
 
@@ -316,9 +320,35 @@ func checkUpcomingMeetings() {
     let recentIds = Set(recentEvents.compactMap { $0.eventIdentifier })
 
     // Remove IDs for meetings that started more than an hour ago
-    warnedMeetingIds = warnedMeetingIds.intersection(recentIds.union(
-        Set(upcomingMeetings.compactMap { $0.eventIdentifier })
-    ))
+    let validIds = recentIds.union(Set(upcomingMeetings.compactMap { $0.eventIdentifier }))
+    warnedMeetingIds = warnedMeetingIds.intersection(validIds)
+
+    // Also clean up meetingStartTimes
+    meetingStartTimes = meetingStartTimes.filter { validIds.contains($0.key) }
+}
+
+/// Check if SOON state should expire (5 minutes into a meeting with no camera activation)
+func checkSoonExpiration() {
+    guard inSoonState else { return }
+    guard !lastCameraState else { return }  // Camera is active, don't expire
+
+    let now = Date()
+    let expirationThreshold = TimeInterval(meetingWarningMinutes * 60)  // 5 minutes into meeting
+
+    // Check if any warned meeting has been running for 5+ minutes without camera activation
+    for (meetingId, startTime) in meetingStartTimes {
+        let timeSinceStart = now.timeIntervalSince(startTime)
+
+        if timeSinceStart >= expirationThreshold {
+            log("SOON state expired: meeting started \(Int(timeSinceStart / 60)) min ago without camera activation")
+            runShortcut(shortcutOff)
+            inSoonState = false
+
+            // Remove this meeting from tracking since we've handled the expiration
+            meetingStartTimes.removeValue(forKey: meetingId)
+            break
+        }
+    }
 }
 
 func executeShortcut(_ name: String) {
@@ -443,6 +473,7 @@ func main() {
                 if currentCameraState {
                     log("Camera became ACTIVE (after \(stableReadings) consistent readings)")
                     runShortcut(shortcutOn)
+                    inSoonState = false  // Camera activated, no longer in SOON state
                 } else {
                     log("Camera became INACTIVE (after \(stableReadings) consistent readings)")
                     runShortcut(shortcutOff)
@@ -457,9 +488,10 @@ func main() {
             stableReadings = 0
         }
 
-        // Check upcoming meetings every 30 seconds (15 loops at 2s interval)
+        // Check upcoming meetings and SOON expiration every 30 seconds (15 loops at 2s interval)
         if loopCount % 15 == 0 {
             checkUpcomingMeetings()
+            checkSoonExpiration()
         }
 
         loopCount += 1
