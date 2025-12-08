@@ -249,6 +249,11 @@ func hasAttendees(_ event: EKEvent) -> Bool {
 }
 
 func isMeeting(_ event: EKEvent) -> Bool {
+    // All-day events are never meetings (birthdays, holidays, reminders, etc.)
+    if event.isAllDay {
+        return false
+    }
+
     // Event is a meeting if it has a video link OR has attendees
     return hasVideoLink(event) || hasAttendees(event)
 }
