@@ -14,21 +14,36 @@ import CoreMediaIO
 import EventKit
 
 // Configuration
+var dryRun = false  // Set to true to skip actual shortcut execution
 let shortcutOn = "MeetingON"
 let shortcutOff = "MeetingOFF"
 let shortcutSoon = "MeetingSOON"
 let checkInterval: UInt32 = 2  // seconds
 let meetingWarningMinutes = 5  // minutes before meeting to trigger warning
 let debounceCount = 2  // Require this many consistent readings before changing state
+let debounceTimeoutSeconds = 10  // Force state change after this many seconds in pending state
+
+// Error handling configuration
+let maxShortcutRetries = 2  // Number of retry attempts for failed shortcuts
+let retryDelaySeconds = 3  // Delay between retry attempts
+
+// Calendar configuration
+let calendarLookAheadBufferSeconds = 60  // Extra time to check beyond warning window
+let meetingCleanupWindowSeconds = 3600   // How far back to check for old meetings (1 hour)
+let meetingCheckIntervalCycles = 15      // Check meetings every N cycles (30s at 2s interval)
 
 // Lock file to prevent multiple instances
-let lockFilePath = "/tmp/webcam-lamp-monitor.lock"
+let appSupportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+let lockDirPath = appSupportDir.appendingPathComponent("WebcamLampController").path
+let lockFilePath = appSupportDir.appendingPathComponent("WebcamLampController/webcam-lamp-monitor.lock").path
+let stateFilePath = appSupportDir.appendingPathComponent("WebcamLampController/state.json").path
 var lockFileDescriptor: Int32 = -1
 
 // State tracking
 var lastCameraState = false
 var pendingState: Bool? = nil  // State we're transitioning to
 var stableReadings = 0  // Count of consistent readings
+var pendingStateStartTime: Date? = nil  // When we entered pending state
 var warnedMeetingIds = Set<String>()  // Track meetings we've already warned about
 var meetingStartTimes = [String: Date]()  // Track start times of meetings we warned about
 var inSoonState = false  // Track if we're currently in SOON state (lamp showing warning)
@@ -38,13 +53,27 @@ var calendarAccessGranted = false
 // Shortcut queue - only keeps the final desired state
 let shortcutLock = NSLock()
 var pendingShortcut: String? = nil
-var shortcutRunning = false
+let shortcutSemaphore = DispatchSemaphore(value: 0)
 let shortcutQueue = DispatchQueue(label: "com.webcamlampcontroller.shortcuts")
 
-func log(_ message: String) {
+// Logging
+enum LogLevel: String {
+    case debug = "DEBUG"
+    case info = "INFO"
+    case warn = "WARN"
+    case error = "ERROR"
+}
+
+var currentLogLevel: LogLevel = .info  // Can be changed to .debug for troubleshooting
+
+func log(_ message: String, level: LogLevel = .info) {
+    // Filter based on log level
+    let levelPriority: [LogLevel: Int] = [.debug: 0, .info: 1, .warn: 2, .error: 3]
+    guard levelPriority[level]! >= levelPriority[currentLogLevel]! else { return }
+
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-    print("[\(formatter.string(from: Date()))] \(message)")
+    print("[\(formatter.string(from: Date()))] [\(level.rawValue)] \(message)")
     fflush(stdout)
 }
 
@@ -53,12 +82,58 @@ func isProcessRunning(pid: pid_t) -> Bool {
     return kill(pid, 0) == 0
 }
 
+// State persistence
+struct PersistedState: Codable {
+    var warnedMeetingIds: [String]
+    var meetingStartTimes: [String: TimeInterval]  // Store as TimeInterval since epoch
+    var inSoonState: Bool
+}
+
+func saveState() {
+    let state = PersistedState(
+        warnedMeetingIds: Array(warnedMeetingIds),
+        meetingStartTimes: meetingStartTimes.mapValues { $0.timeIntervalSince1970 },
+        inSoonState: inSoonState
+    )
+
+    do {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .prettyPrinted
+        let data = try encoder.encode(state)
+        try data.write(to: URL(fileURLWithPath: stateFilePath))
+        log("State saved", level: .debug)
+    } catch {
+        log("Failed to save state: \(error.localizedDescription)", level: .warn)
+    }
+}
+
+func loadState() {
+    guard FileManager.default.fileExists(atPath: stateFilePath) else {
+        log("No previous state file found", level: .debug)
+        return
+    }
+
+    do {
+        let data = try Data(contentsOf: URL(fileURLWithPath: stateFilePath))
+        let decoder = JSONDecoder()
+        let state = try decoder.decode(PersistedState.self, from: data)
+
+        warnedMeetingIds = Set(state.warnedMeetingIds)
+        meetingStartTimes = state.meetingStartTimes.mapValues { Date(timeIntervalSince1970: $0) }
+        inSoonState = state.inSoonState
+
+        log("State loaded: \(warnedMeetingIds.count) warned meetings, inSoonState=\(inSoonState)", level: .debug)
+    } catch {
+        log("Failed to load state: \(error.localizedDescription)", level: .warn)
+    }
+}
+
 func cleanStaleLock() -> Bool {
     // Try to read the PID from existing lock file
     guard let contents = try? String(contentsOfFile: lockFilePath, encoding: .utf8),
           let pid = pid_t(contents.trimmingCharacters(in: .whitespacesAndNewlines)) else {
         // Can't read PID, assume stale and remove
-        log("Removing unreadable lock file")
+        log("Removing unreadable lock file", level: .warn)
         unlink(lockFilePath)
         return true
     }
@@ -69,16 +144,19 @@ func cleanStaleLock() -> Bool {
     }
 
     // Process is dead, remove stale lock
-    log("Removing stale lock file (PID \(pid) is not running)")
+    log("Removing stale lock file (PID \(pid) is not running)", level: .warn)
     unlink(lockFilePath)
     return true
 }
 
 func acquireLock() -> Bool {
+    // Ensure lock directory exists
+    try? FileManager.default.createDirectory(atPath: lockDirPath, withIntermediateDirectories: true, attributes: nil)
+
     // Create or open lock file
     lockFileDescriptor = open(lockFilePath, O_CREAT | O_RDWR, 0o644)
     if lockFileDescriptor < 0 {
-        log("Error: Could not create lock file")
+        log("Could not create lock file", level: .error)
         return false
     }
 
@@ -92,17 +170,17 @@ func acquireLock() -> Bool {
             // Try again after cleaning stale lock
             lockFileDescriptor = open(lockFilePath, O_CREAT | O_RDWR, 0o644)
             if lockFileDescriptor < 0 {
-                log("Error: Could not create lock file after cleanup")
+                log("Could not create lock file after cleanup", level: .error)
                 return false
             }
             if flock(lockFileDescriptor, LOCK_EX | LOCK_NB) != 0 {
-                log("Error: Could not acquire lock after cleanup")
+                log("Could not acquire lock after cleanup", level: .error)
                 close(lockFileDescriptor)
                 lockFileDescriptor = -1
                 return false
             }
         } else {
-            log("Error: Another instance is already running")
+            log("Another instance is already running", level: .error)
             return false
         }
     }
@@ -133,26 +211,26 @@ func requestCalendarAccess() {
     if #available(macOS 14.0, *) {
         eventStore.requestFullAccessToEvents { granted, error in
             if let error = error {
-                log("Calendar access error: \(error.localizedDescription)")
+                log("Calendar access error: \(error.localizedDescription)", level: .error)
             }
             calendarAccessGranted = granted
             if granted {
                 log("Calendar access granted")
             } else {
-                log("Calendar access denied - meeting warnings will be disabled")
+                log("Calendar access denied - meeting warnings will be disabled", level: .warn)
             }
             semaphore.signal()
         }
     } else {
         eventStore.requestAccess(to: .event) { granted, error in
             if let error = error {
-                log("Calendar access error: \(error.localizedDescription)")
+                log("Calendar access error: \(error.localizedDescription)", level: .error)
             }
             calendarAccessGranted = granted
             if granted {
                 log("Calendar access granted")
             } else {
-                log("Calendar access denied - meeting warnings will be disabled")
+                log("Calendar access denied - meeting warnings will be disabled", level: .warn)
             }
             semaphore.signal()
         }
@@ -171,15 +249,23 @@ func isAnyCameraActive() -> Bool {
     var dataSize: UInt32 = 0
     var result = CMIOObjectGetPropertyDataSize(CMIOObjectID(kCMIOObjectSystemObject), &propertyAddress, 0, nil, &dataSize)
 
-    guard result == 0 else { return false }
+    guard result == 0 else {
+        log("Failed to get camera device list size (result: \(result))", level: .warn)
+        return false
+    }
 
     let deviceCount = Int(dataSize) / MemoryLayout<CMIODeviceID>.size
+    log("Found \(deviceCount) camera device(s)", level: .debug)
+
     var deviceIDs = Array(repeating: CMIODeviceID(0), count: deviceCount)
     result = CMIOObjectGetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &propertyAddress, 0, nil, dataSize, &dataSize, &deviceIDs)
 
-    guard result == 0 else { return false }
+    guard result == 0 else {
+        log("Failed to get camera device list (result: \(result))", level: .warn)
+        return false
+    }
 
-    for deviceID in deviceIDs {
+    for (index, deviceID) in deviceIDs.enumerated() {
         var isRunningAddress = CMIOObjectPropertyAddress(
             mSelector: CMIOObjectPropertySelector(kCMIODevicePropertyDeviceIsRunningSomewhere),
             mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
@@ -190,6 +276,7 @@ func isAnyCameraActive() -> Bool {
         let runningResult = CMIOObjectGetPropertyData(deviceID, &isRunningAddress, 0, nil, runningSize, &runningSize, &isRunning)
 
         if runningResult == 0 && isRunning != 0 {
+            log("Camera device #\(index) (ID: \(deviceID)) is ACTIVE", level: .debug)
             return true
         }
     }
@@ -253,11 +340,17 @@ func hasAttendees(_ event: EKEvent) -> Bool {
 func isMeeting(_ event: EKEvent) -> Bool {
     // All-day events are never meetings (birthdays, holidays, reminders, etc.)
     if event.isAllDay {
+        log("Event '\(event.title ?? "Untitled")' is all-day, skipping", level: .debug)
         return false
     }
 
+    let hasVideo = hasVideoLink(event)
+    let hasAtts = hasAttendees(event)
+
+    log("Event '\(event.title ?? "Untitled")': videoLink=\(hasVideo), attendees=\(hasAtts)", level: .debug)
+
     // Event is a meeting if it has a video link OR has attendees
-    return hasVideoLink(event) || hasAttendees(event)
+    return hasVideo || hasAtts
 }
 
 func getUpcomingMeetings() -> [EKEvent] {
@@ -265,7 +358,7 @@ func getUpcomingMeetings() -> [EKEvent] {
 
     let now = Date()
     let warningWindow = TimeInterval(meetingWarningMinutes * 60)
-    let lookAhead = TimeInterval(meetingWarningMinutes * 60 + 60)  // Check slightly ahead
+    let lookAhead = TimeInterval(meetingWarningMinutes * 60 + calendarLookAheadBufferSeconds)
 
     let startDate = now
     let endDate = now.addingTimeInterval(lookAhead)
@@ -283,14 +376,19 @@ func getUpcomingMeetings() -> [EKEvent] {
 }
 
 func checkUpcomingMeetings() {
-    guard calendarAccessGranted else { return }
+    guard calendarAccessGranted else {
+        log("Skipping meeting check: calendar access not granted", level: .debug)
+        return
+    }
 
     // Don't warn about upcoming meetings if we're already in a meeting (camera active)
     if lastCameraState {
+        log("Skipping meeting check: camera already active", level: .debug)
         return
     }
 
     let upcomingMeetings = getUpcomingMeetings()
+    log("Found \(upcomingMeetings.count) upcoming meeting(s)", level: .debug)
 
     for meeting in upcomingMeetings {
         let meetingId = meeting.eventIdentifier ?? UUID().uuidString
@@ -305,6 +403,7 @@ func checkUpcomingMeetings() {
             warnedMeetingIds.insert(meetingId)
             meetingStartTimes[meetingId] = meeting.startDate
             inSoonState = true
+            saveState()  // Persist state after warning
         }
     }
 
@@ -312,7 +411,7 @@ func checkUpcomingMeetings() {
     let now = Date()
     let calendars = eventStore.calendars(for: .event)
     let predicate = eventStore.predicateForEvents(
-        withStart: now.addingTimeInterval(-3600),  // 1 hour ago
+        withStart: now.addingTimeInterval(-TimeInterval(meetingCleanupWindowSeconds)),
         end: now,
         calendars: calendars
     )
@@ -321,10 +420,16 @@ func checkUpcomingMeetings() {
 
     // Remove IDs for meetings that started more than an hour ago
     let validIds = recentIds.union(Set(upcomingMeetings.compactMap { $0.eventIdentifier }))
+    let previousCount = warnedMeetingIds.count
     warnedMeetingIds = warnedMeetingIds.intersection(validIds)
 
     // Also clean up meetingStartTimes
     meetingStartTimes = meetingStartTimes.filter { validIds.contains($0.key) }
+
+    // Save state if we cleaned up any IDs
+    if warnedMeetingIds.count != previousCount {
+        saveState()
+    }
 }
 
 /// Check if SOON state should expire (5 minutes into a meeting with no camera activation)
@@ -335,61 +440,157 @@ func checkSoonExpiration() {
     let now = Date()
     let expirationThreshold = TimeInterval(meetingWarningMinutes * 60)  // 5 minutes into meeting
 
-    // Check if any warned meeting has been running for 5+ minutes without camera activation
+    // Find all meetings that have expired (started 5+ minutes ago)
+    var expiredMeetingIds: [String] = []
+
     for (meetingId, startTime) in meetingStartTimes {
         let timeSinceStart = now.timeIntervalSince(startTime)
 
         if timeSinceStart >= expirationThreshold {
-            log("SOON state expired: meeting started \(Int(timeSinceStart / 60)) min ago without camera activation")
-            runShortcut(shortcutOff)
-            inSoonState = false
-
-            // Remove this meeting from tracking since we've handled the expiration
-            meetingStartTimes.removeValue(forKey: meetingId)
-            break
+            log("Meeting expired: started \(Int(timeSinceStart / 60)) min ago without camera activation (ID: \(meetingId))", level: .debug)
+            expiredMeetingIds.append(meetingId)
         }
+    }
+
+    // If we have expired meetings, handle the expiration
+    if !expiredMeetingIds.isEmpty {
+        log("SOON state expired: \(expiredMeetingIds.count) meeting(s) started without camera activation")
+        runShortcut(shortcutOff)
+        inSoonState = false
+
+        // Remove all expired meetings from tracking
+        for meetingId in expiredMeetingIds {
+            meetingStartTimes.removeValue(forKey: meetingId)
+        }
+        saveState()  // Persist state change
     }
 }
 
-func executeShortcut(_ name: String) {
+func listAvailableShortcuts() -> [String] {
     let process = Process()
+    let pipe = Pipe()
+
     process.executableURL = URL(fileURLWithPath: "/usr/bin/shortcuts")
-    process.arguments = ["run", name]
+    process.arguments = ["list"]
+    process.standardOutput = pipe
 
     do {
         try process.run()
         process.waitUntilExit()
 
-        if process.terminationStatus == 0 {
-            log("Shortcut '\(name)' completed successfully")
-        } else {
-            log("Warning: Shortcut '\(name)' may have failed (exit code \(process.terminationStatus))")
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        if let output = String(data: data, encoding: .utf8) {
+            return output.components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
         }
     } catch {
-        log("Error running shortcut '\(name)': \(error.localizedDescription)")
+        log("Failed to list shortcuts: \(error.localizedDescription)", level: .warn)
+    }
+
+    return []
+}
+
+func validateShortcuts() -> Bool {
+    log("Validating shortcuts...")
+
+    let availableShortcuts = listAvailableShortcuts()
+    let requiredShortcuts = [shortcutOn, shortcutOff, shortcutSoon]
+    var allValid = true
+
+    for shortcut in requiredShortcuts {
+        if availableShortcuts.contains(shortcut) {
+            log("✓ Shortcut '\(shortcut)' found", level: .debug)
+        } else {
+            log("✗ Shortcut '\(shortcut)' NOT FOUND", level: .error)
+            allValid = false
+        }
+    }
+
+    if !allValid {
+        log("", level: .error)
+        log("ERROR: Some required shortcuts are missing!", level: .error)
+        log("Please create the missing shortcuts in Shortcuts.app:", level: .error)
+        for shortcut in requiredShortcuts {
+            if !availableShortcuts.contains(shortcut) {
+                log("  - \(shortcut)", level: .error)
+            }
+        }
+        log("See README.md for setup instructions.", level: .error)
+    } else {
+        log("All required shortcuts are available ✓")
+    }
+
+    return allValid
+}
+
+func executeShortcut(_ name: String) {
+    if dryRun {
+        log("[DRY-RUN] Would execute shortcut '\(name)'")
+        return
+    }
+
+    var attempts = 0
+    let maxAttempts = maxShortcutRetries + 1  // Initial attempt + retries
+
+    while attempts < maxAttempts {
+        attempts += 1
+        let attemptLabel = attempts > 1 ? " (attempt \(attempts)/\(maxAttempts))" : ""
+
+        let startTime = Date()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/shortcuts")
+        process.arguments = ["run", name]
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+
+            let duration = Date().timeIntervalSince(startTime)
+
+            if process.terminationStatus == 0 {
+                log("Shortcut '\(name)' completed successfully in \(String(format: "%.2f", duration))s\(attemptLabel)", level: .debug)
+                return  // Success - exit retry loop
+            } else {
+                let message = "Shortcut '\(name)' failed with exit code \(process.terminationStatus) after \(String(format: "%.2f", duration))s\(attemptLabel)"
+
+                if attempts < maxAttempts {
+                    log("\(message), retrying in \(retryDelaySeconds)s...", level: .warn)
+                    sleep(UInt32(retryDelaySeconds))
+                } else {
+                    log("\(message), giving up after \(attempts) attempts", level: .error)
+                }
+            }
+        } catch {
+            let message = "Error running shortcut '\(name)': \(error.localizedDescription)\(attemptLabel)"
+
+            if attempts < maxAttempts {
+                log("\(message), retrying in \(retryDelaySeconds)s...", level: .warn)
+                sleep(UInt32(retryDelaySeconds))
+            } else {
+                log("\(message), giving up after \(attempts) attempts", level: .error)
+            }
+        }
     }
 }
 
-func processShortcutQueue() {
+func startShortcutWorker() {
     shortcutQueue.async {
         while true {
-            // Get next shortcut to run (if any)
+            // Wait for a shortcut to be queued
+            shortcutSemaphore.wait()
+
+            // Get the shortcut to run
             shortcutLock.lock()
             let shortcutToRun = pendingShortcut
             pendingShortcut = nil
-            if shortcutToRun != nil {
-                shortcutRunning = true
-            } else {
-                shortcutRunning = false
-            }
             shortcutLock.unlock()
 
-            guard let name = shortcutToRun else {
-                return
+            // Run it if we have one
+            if let name = shortcutToRun {
+                log("Running shortcut: \(name)")
+                executeShortcut(name)
             }
-
-            log("Running shortcut: \(name)")
-            executeShortcut(name)
         }
     }
 }
@@ -397,10 +598,12 @@ func processShortcutQueue() {
 func runShortcut(_ name: String) {
     shortcutLock.lock()
 
+    let hadPendingShortcut = (pendingShortcut != nil)
+
     // For ON/OFF shortcuts, replace any pending shortcut (coalesce rapid changes)
     if name == shortcutOn || name == shortcutOff {
         if let pending = pendingShortcut, pending != name {
-            log("Replacing pending shortcut '\(pending)' with '\(name)'")
+            log("Replacing pending shortcut '\(pending)' with '\(name)'", level: .debug)
         }
         pendingShortcut = name
     } else {
@@ -409,31 +612,63 @@ func runShortcut(_ name: String) {
             pendingShortcut = name
         } else {
             // SOON doesn't replace ON/OFF, just skip if something is pending
-            log("Skipping '\(name)' - another shortcut is pending")
+            log("Skipping '\(name)' - another shortcut is pending", level: .debug)
             shortcutLock.unlock()
             return
         }
     }
 
-    let shouldStartProcessing = !shortcutRunning
     shortcutLock.unlock()
 
-    // Start processing if not already running
-    if shouldStartProcessing {
-        processShortcutQueue()
+    // Signal the worker thread only if we just added a new shortcut
+    // (not if we replaced an existing pending one)
+    if !hadPendingShortcut {
+        shortcutSemaphore.signal()
     }
 }
 
 func main() {
-    log("Webcam Lamp Monitor started")
+    // Parse command-line arguments
+    let args = CommandLine.arguments
+    if args.contains("--dry-run") || args.contains("-n") {
+        dryRun = true
+    }
+    if args.contains("--debug") || args.contains("-d") {
+        currentLogLevel = .debug
+    }
+    if args.contains("--help") || args.contains("-h") {
+        print("Usage: webcam-lamp-monitor [OPTIONS]")
+        print("")
+        print("Options:")
+        print("  --dry-run, -n     Run without executing shortcuts (testing mode)")
+        print("  --debug, -d       Enable debug logging")
+        print("  --help, -h        Show this help message")
+        exit(0)
+    }
+
+    log("Webcam Lamp Monitor started\(dryRun ? " [DRY-RUN MODE]" : "")")
     log("Shortcuts: ON='\(shortcutOn)', OFF='\(shortcutOff)', SOON='\(shortcutSoon)'")
     log("Check interval: \(checkInterval)s, Meeting warning: \(meetingWarningMinutes) min before")
     log("Debounce: \(debounceCount) consistent readings required")
+    log("Log level: \(currentLogLevel.rawValue)")
 
     // Acquire lock to prevent multiple instances
     guard acquireLock() else {
         exit(1)
     }
+
+    // Load persisted state
+    loadState()
+
+    // Validate required shortcuts exist
+    guard validateShortcuts() else {
+        log("Exiting due to missing shortcuts", level: .error)
+        releaseLock()
+        exit(1)
+    }
+
+    // Start the shortcut worker thread
+    startShortcutWorker()
 
     // Request calendar access
     requestCalendarAccess()
@@ -441,11 +676,13 @@ func main() {
     // Handle graceful shutdown
     signal(SIGTERM) { _ in
         log("Shutting down...")
+        saveState()
         releaseLock()
         exit(0)
     }
     signal(SIGINT) { _ in
         log("Shutting down...")
+        saveState()
         releaseLock()
         exit(0)
     }
@@ -463,33 +700,54 @@ func main() {
                 // Same pending state, increment counter
                 stableReadings += 1
             } else {
-                // New pending state, reset counter
+                // New pending state, reset counter and start time
                 pendingState = currentCameraState
                 stableReadings = 1
+                pendingStateStartTime = Date()
             }
 
-            // Only trigger state change after enough consistent readings
+            // Check if we should trigger state change
+            var shouldTrigger = false
+            var triggerReason = ""
+
             if stableReadings >= debounceCount {
+                shouldTrigger = true
+                triggerReason = "after \(stableReadings) consistent readings"
+            } else if let startTime = pendingStateStartTime {
+                // Force trigger if we've been in pending state too long
+                let timeInPending = Date().timeIntervalSince(startTime)
+                if timeInPending >= TimeInterval(debounceTimeoutSeconds) {
+                    shouldTrigger = true
+                    triggerReason = "timeout after \(Int(timeInPending))s in pending state"
+                }
+            }
+
+            if shouldTrigger {
                 if currentCameraState {
-                    log("Camera became ACTIVE (after \(stableReadings) consistent readings)")
+                    log("Camera became ACTIVE (\(triggerReason))")
                     runShortcut(shortcutOn)
-                    inSoonState = false  // Camera activated, no longer in SOON state
+                    if inSoonState {
+                        inSoonState = false  // Camera activated, no longer in SOON state
+                        saveState()  // Persist state change
+                    }
                 } else {
-                    log("Camera became INACTIVE (after \(stableReadings) consistent readings)")
+                    log("Camera became INACTIVE (\(triggerReason))")
                     runShortcut(shortcutOff)
                 }
                 lastCameraState = currentCameraState
                 pendingState = nil
                 stableReadings = 0
+                pendingStateStartTime = nil
             }
         } else {
             // State is stable, reset pending
             pendingState = nil
             stableReadings = 0
+            pendingStateStartTime = nil
         }
 
-        // Check upcoming meetings and SOON expiration every 30 seconds (15 loops at 2s interval)
-        if loopCount % 15 == 0 {
+        // Check upcoming meetings and SOON expiration periodically
+        if loopCount % meetingCheckIntervalCycles == 0 {
             checkUpcomingMeetings()
             checkSoonExpiration()
         }
